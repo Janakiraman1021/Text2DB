@@ -1,5 +1,6 @@
 "use client"
 
+import Link from "next/link"
 import { useMemo } from "react"
 import { cn } from "@/lib/utils"
 
@@ -51,18 +52,18 @@ export function NeoHeader() {
 
       {/* Simple navigation */}
       <nav className="mt-6 flex justify-center gap-4">
-        <a href="/" className="nav-link">
+        <Link href="/" className="nav-link">
           Home
-        </a>
-        <a href="/working" className="nav-link">
+        </Link>
+        <Link href="/working" className="nav-link">
           Working
-        </a>
-        <a href="/features" className="nav-link">
+        </Link>
+        <Link href="/features" className="nav-link">
           Features
-        </a>
-        <a href="/about" className="nav-link">
+        </Link>
+        <Link href="/about" className="nav-link">
           About
-        </a>
+        </Link>
       </nav>
 
       {/* Title */}

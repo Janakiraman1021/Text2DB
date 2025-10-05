@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -7,46 +8,47 @@ import json
 import os
 import re
 from dotenv import load_dotenv
+from datetime import datetime
+from decimal import Decimal
+from fastapi import FastAPI, HTTPException
+import logging
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+from mongo_conn import db
+import json
+import os
+import re
+from dotenv import load_dotenv
+from datetime import datetime
+from decimal import Decimal
+try:
+    from bson import ObjectId
+except Exception:
+    ObjectId = None
 
-
-# ---------------------
-# Load environment variables
-# ---------------------
 load_dotenv()
 OLLAMA_API = os.getenv("OLLAMA_API", "http://localhost:11434/api/generate")
 
 print(f"🔹 Using Ollama API: {OLLAMA_API}")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("text2db")
 
-# ---------------------
-# Initialize FastAPI
-# ---------------------
 app = FastAPI(title="Text2DB AI")
 
-
-# ---------------------
-# Enable CORS
-# ---------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # replace "*" with frontend URL in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ---------------------
-# Request schema
-# ---------------------
 class QueryRequest(BaseModel):
     text: str
     collection: str
 
-
-# ---------------------
-# Helper: Extract JSON from LLM output
-# ---------------------
 def extract_json_from_text(text: str) -> str:
     """
     Extract JSON from LLM output using regex for {...} pattern.
@@ -56,10 +58,77 @@ def extract_json_from_text(text: str) -> str:
         return match.group(1)
     return ""
 
+def make_json_safe(obj):
+    """Recursively convert ObjectId, datetime, bytes, Decimal, and other common
+    non-JSON types into JSON-serializable forms.
+    """
+    if ObjectId is not None and isinstance(obj, ObjectId):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode('utf-8')
+        except Exception:
+            return str(obj)
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return str(obj)
 
-# ---------------------
-# POST endpoint: Text → MongoDB Query
-# ---------------------
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(make_json_safe(v) for v in obj)
+
+    return obj
+
+def normalize_update_ops(update_obj):
+    """Normalize nonstandard update operators into Mongo-friendly operators.
+    Specifically, convert any occurrence of "$remove" or "remove" into "$unset`.
+    Works recursively and merges multiple occurrences into a single $unset dict.
+    """
+    if not isinstance(update_obj, dict):
+        return update_obj
+
+    unset_accum = {}
+
+    def recurse(obj, parent=None, parent_key=None):
+        nonlocal unset_accum
+        if isinstance(obj, dict):
+            keys = list(obj.keys())
+            for k in keys:
+                v = obj.get(k)
+                if k == "$remove" or k == "remove":
+                    if isinstance(v, list):
+                        for f in v:
+                            if isinstance(f, str):
+                                unset_accum[f] = ""
+                    elif isinstance(v, dict):
+                        for f in v.keys():
+                            unset_accum[f] = ""
+                    elif isinstance(v, str):
+                        unset_accum[v] = ""
+                    obj.pop(k, None)
+                else:
+                    recurse(v, obj, k)
+        elif isinstance(obj, list):
+            for item in obj:
+                recurse(item, parent, parent_key)
+
+    out = dict(update_obj)
+    recurse(out)
+
+    if "$unset" in out and isinstance(out["$unset"], dict):
+        out["$unset"] = {**out["$unset"], **unset_accum}
+    elif unset_accum:
+        out["$unset"] = unset_accum
+
+    return out
+
 @app.post("/query")
 def generate_and_run_query(req: QueryRequest):
     prompt = f"""
@@ -70,7 +139,6 @@ Natural language: "{req.text}"
 Collection name: "{req.collection}"
 """
 
-    # Prepare response envelope
     envelope = {
         "original_text": req.text,
         "tokens": None,
@@ -81,70 +149,56 @@ Collection name: "{req.collection}"
         "error": None,
     }
 
-    # include DB and collection names
     try:
         envelope["db_name"] = getattr(db, "name", os.getenv("DB_NAME"))
     except Exception:
         envelope["db_name"] = os.getenv("DB_NAME")
     envelope["collection_name"] = req.collection
 
-    # Helper: simple fallback tokenization
     def simple_tokenize(text: str):
         try:
-            # Return list of utf-8 byte hex values as a reproducible token-like representation
             b = text.encode("utf-8")
             return [f"0x{byte:02x}" for byte in b]
         except Exception:
             return [c for c in text]
 
-    # Compute tokens for the input text
     envelope["tokens"] = simple_tokenize(req.text)
 
-    # Call Ollama API
     try:
         response = requests.post(
             OLLAMA_API,
             json={"model": "mistral", "prompt": prompt},
-            timeout=20  # avoid hanging
+            timeout=20
         )
         response.raise_for_status()
 
-        # Capture raw text first (some LLM servers return non-JSON or newline-delimited JSON)
         resp_text = response.text
         envelope["raw_response"] = resp_text
 
-        # Try structured parsing first
         resp_json = None
         ndjson_responses = []
 
-        # If the server returned multiple JSON objects (NDJSON/stream), parse line-by-line
         for line in resp_text.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
-                # If object contains a 'response' field, collect it (streamed chunk)
                 if isinstance(obj, dict) and "response" in obj:
                     ndjson_responses.append(obj.get("response") or "")
                 else:
-                    # keep as candidate structured JSON
                     if resp_json is None and isinstance(obj, dict):
                         resp_json = obj
             except Exception:
-                # not a JSON line; ignore
                 continue
 
         combined_output = ""
         if ndjson_responses:
-            # Concatenate streamed response parts in order
             combined_output = "".join(ndjson_responses)
-            # sanitize leading/trailing code fences and whitespace
             combined_output = combined_output.strip()
             combined_output = combined_output.strip("` \n\r")
             envelope["raw_response"] = ndjson_responses
         else:
-            # fallback: try to parse whole response as JSON once
             try:
                 resp_json = response.json()
             except Exception:
@@ -157,7 +211,6 @@ Collection name: "{req.collection}"
                 envelope["raw_response"] = resp_text
 
         output = (combined_output or "").strip()
-        # Try to find the first JSON object within the reconstructed output by locating the first '{'
         first_obj = None
         cleaned_json_text = ""
         pos = output.find("{")
@@ -173,54 +226,48 @@ Collection name: "{req.collection}"
             cleaned_json_text = output
 
         envelope["clean_output"] = cleaned_json_text
-        # if we successfully parsed a structured object from the reconstructed stream, prefer it
         if first_obj is not None:
             resp_json = first_obj
         print("🔹 Raw Ollama output (reconstructed):", output)
     except requests.exceptions.RequestException as e:
         envelope["error"] = f"Ollama API connection error: {str(e)}"
-        raise HTTPException(status_code=500, detail=envelope)
+        logger.error("Ollama connection error: %s", json.dumps(envelope, default=str, indent=2))
+        raise HTTPException(status_code=500, detail=make_json_safe(envelope))
     except Exception as e:
         envelope["error"] = f"Ollama API error: {str(e)}"
-        raise HTTPException(status_code=500, detail=envelope)
+        logger.error("Ollama API error: %s", json.dumps(envelope, default=str, indent=2))
+        raise HTTPException(status_code=500, detail=make_json_safe(envelope))
 
-    # Clean output to extract JSON only
     clean_output = extract_json_from_text(output)
     if not clean_output:
         envelope["clean_output"] = output
         envelope["error"] = f"No valid JSON found in Ollama response"
-        # Return envelope with error info instead of raising
-        raise HTTPException(status_code=400, detail=envelope)
+        logger.error("No valid JSON found in Ollama response: %s", json.dumps(envelope, default=str, indent=2))
+        raise HTTPException(status_code=400, detail=make_json_safe(envelope))
 
-    # Convert JSON string to Python dict: parse first JSON object even if extra data follows
     try:
         decoder = json.JSONDecoder()
         mongo_query, idx = decoder.raw_decode(clean_output)
         envelope["query"] = mongo_query
-        # if extra data exists after the JSON object, note it in envelope but still proceed
         if idx < len(clean_output.strip()):
             envelope["warning"] = f"Extra data after JSON at position {idx}"
     except json.JSONDecodeError as e:
         envelope["clean_output"] = clean_output
         envelope["error"] = f"Invalid MongoDB query JSON: {str(e)}"
-        raise HTTPException(status_code=400, detail=envelope)
+        logger.error("Invalid MongoDB query JSON: %s", json.dumps(envelope, default=str, indent=2))
+        raise HTTPException(status_code=400, detail=make_json_safe(envelope))
 
-    # Execute query on MongoDB
     try:
         collection = db[req.collection]
 
-        # If the LLM returned a wrapper (e.g., { filter: {...}, limit: 10, sort: [...] }), normalize it
         executed_filter = None
         find_kwargs = {}
 
         if isinstance(mongo_query, dict) and any(k in mongo_query for k in ("filter", "query", "where", "q", "find")):
-            # support several common wrapper keys
-            # If it's a find wrapper like { "find": "users", "filter": { ... } }
             if "filter" in mongo_query:
                 executed_filter = mongo_query.get("filter")
             else:
                 executed_filter = mongo_query.get("query") or mongo_query.get("where") or mongo_query.get("q")
-            # projection
             if "projection" in mongo_query and isinstance(mongo_query["projection"], dict):
                 find_kwargs["projection"] = mongo_query["projection"]
             if "limit" in mongo_query:
@@ -234,7 +281,6 @@ Collection name: "{req.collection}"
                 except Exception:
                     pass
             if "sort" in mongo_query:
-                # allow sort as list of [ [field, 1], ... ] or dict {field: 1}
                 sort_val = mongo_query["sort"]
                 if isinstance(sort_val, dict):
                     find_kwargs["sort"] = list(sort_val.items())
@@ -243,29 +289,164 @@ Collection name: "{req.collection}"
         else:
             executed_filter = mongo_query
 
-        # Record what we'll execute
         envelope["executed_filter"] = executed_filter
         envelope["executed_options"] = find_kwargs
 
-        # Perform the find with options; handle limit via cursor.limit
-        cursor = collection.find(executed_filter or {}, {"_id": 0}, **({} if "projection" in find_kwargs else {}))
-        # apply projection if provided separately
-        if "projection" in find_kwargs:
-            # pymongo allows projection in find; we already passed projection separately if needed
-            cursor = collection.find(executed_filter or {}, find_kwargs.get("projection"))
-        if "sort" in find_kwargs:
-            cursor = cursor.sort(find_kwargs["sort"])
-        if "skip" in find_kwargs:
-            cursor = cursor.skip(find_kwargs["skip"])
-        if "limit" in find_kwargs:
-            cursor = cursor.limit(find_kwargs["limit"])
+        if isinstance(executed_filter, dict) and "operation" in executed_filter:
+            op_val = executed_filter.pop("operation")
+            logger.debug("Extracted embedded operation from executed_filter: %s", op_val)
+            if isinstance(op_val, str) and op_val.lower() == "remove":
+                mongo_query["remove"] = True
+            elif isinstance(op_val, dict):
+                if "$remove" in op_val:
+                    mongo_query["remove"] = True
+                else:
+                    mongo_query["operation"] = op_val
 
-        results = list(cursor)
-        envelope["results"] = results
-        return envelope
+        op_handled = False
+
+        if isinstance(mongo_query, dict) and "insert" in mongo_query:
+            ins = mongo_query["insert"]
+            if isinstance(ins, list):
+                res = collection.insert_many(ins)
+                envelope["operation"] = "insert_many"
+                envelope["inserted_ids"] = [str(i) for i in res.inserted_ids]
+                envelope["results"] = ins
+            elif isinstance(ins, dict):
+                res = collection.insert_one(ins)
+                envelope["operation"] = "insert_one"
+                envelope["inserted_id"] = str(res.inserted_id)
+                envelope["results"] = [ins]
+            else:
+                envelope["error"] = "Unsupported insert shape"
+            op_handled = True
+
+        if not op_handled and isinstance(mongo_query, dict) and "update" in mongo_query:
+            upd = mongo_query["update"]
+            filt = mongo_query.get("query") or mongo_query.get("filter") or executed_filter or {}
+            upsert = bool(mongo_query.get("upsert"))
+
+            if upsert and (not filt or filt == {}) and isinstance(upd, dict):
+                try:
+                    doc = dict(upd)
+                    if doc.get("_id") in (None, "null"):
+                        doc.pop("_id", None)
+                    res = collection.insert_one(doc)
+                    envelope["operation"] = "insert_one_via_upsert"
+                    envelope["inserted_id"] = str(res.inserted_id)
+                    envelope["results"] = [doc]
+                except Exception as ie:
+                    envelope["error"] = f"Insert via upsert failed: {str(ie)}"
+                op_handled = True
+            else: 
+                try:
+                    final_update = None
+                    if isinstance(upd, dict) and any(k.startswith("$") for k in upd.keys()):
+                        final_update = normalize_update_ops(dict(upd))
+                    else:
+                        final_update = {"$set": upd}
+
+                    res = collection.update_one(filt or {}, final_update, upsert=upsert)
+                    envelope["operation"] = "update_one"
+                    envelope["matched_count"] = res.matched_count
+                    envelope["modified_count"] = res.modified_count
+                    envelope["upserted_id"] = str(res.upserted_id) if res.upserted_id else None
+                    try:
+                        found = list(collection.find(filt or {}, {"_id": 0}))
+                        envelope["results"] = found
+                    except Exception:
+                        envelope["results"] = None
+                except Exception as ue:
+                    envelope["error"] = f"Update operation failed: {str(ue)}"
+                    logger.error("Update operation failed: %s", json.dumps(envelope, default=str, indent=2))
+                    raise HTTPException(status_code=400, detail=make_json_safe(envelope))
+                op_handled = True
+
+        if not op_handled and isinstance(mongo_query, dict) and any(k in mongo_query for k in (
+            "delete", "delete_one", "delete_many", "remove", "remove_one", "remove_many", "justOne", "just_one"
+        )):
+            try:
+                if "delete_many" in mongo_query or "remove_many" in mongo_query:
+                    key = "delete_many" if "delete_many" in mongo_query else "remove_many"
+                    df = mongo_query[key]
+                    if isinstance(df, dict) and any(k in df for k in ("filter", "query", "where")):
+                        df = df.get("filter") or df.get("query") or df.get("where") or {}
+                    res = collection.delete_many(df or {})
+                    envelope["operation"] = "delete_many"
+                    envelope["deleted_count"] = res.deleted_count
+                elif "delete_one" in mongo_query or "remove_one" in mongo_query:
+                    key = "delete_one" if "delete_one" in mongo_query else "remove_one"
+                    df = mongo_query[key]
+                    if isinstance(df, dict) and any(k in df for k in ("filter", "query", "where")):
+                        df = df.get("filter") or df.get("query") or df.get("where") or {}
+                    res = collection.delete_one(df or {})
+                    envelope["operation"] = "delete_one"
+                    envelope["deleted_count"] = res.deleted_count
+                else:
+                    df = None
+                    if "delete" in mongo_query:
+                        df = mongo_query.get("delete")
+                    elif "remove" in mongo_query:
+                        df = mongo_query.get("remove")
+
+                    if isinstance(df, dict) and any(k in df for k in ("filter", "query", "where")):
+                        df = df.get("filter") or df.get("query") or df.get("where") or None
+
+                    if isinstance(df, bool) and df is True:
+                        df = executed_filter or {}
+
+                    if df is None:
+                        df = mongo_query.get("query") or executed_filter or {}
+
+                    just_one = False
+                    if "justOne" in mongo_query:
+                        just_one = bool(mongo_query.get("justOne"))
+                    elif "just_one" in mongo_query:
+                        just_one = bool(mongo_query.get("just_one"))
+
+                    if just_one:
+                        res = collection.delete_one(df or {})
+                        envelope["operation"] = "delete_one"
+                        envelope["deleted_count"] = res.deleted_count
+                    else:
+                        res = collection.delete_many(df or {})
+                        envelope["operation"] = "delete_many"
+                        envelope["deleted_count"] = res.deleted_count
+
+                envelope["results"] = []
+                op_handled = True
+            except Exception as de:
+                envelope["error"] = f"Delete operation failed: {str(de)}"
+                logger.error("Delete operation failed: %s", json.dumps(envelope, default=str, indent=2))
+                raise HTTPException(status_code=400, detail=make_json_safe(envelope))
+
+        if isinstance(mongo_query, dict) and "operation" in mongo_query:
+            operation = mongo_query["operation"]
+            if isinstance(operation, dict) and "$remove" in operation:
+                mongo_query["operation"] = {"$unset": operation["$remove"]}
+
+        if "remove" in mongo_query and "delete" not in mongo_query:
+            mongo_query["delete_many"] = mongo_query.pop("remove")
+
+        if not op_handled:
+            cursor = collection.find(executed_filter or {}, {"_id": 0}, **({} if "projection" in find_kwargs else {}))
+            if "projection" in find_kwargs:
+                cursor = collection.find(executed_filter or {}, find_kwargs.get("projection"))
+            if "sort" in find_kwargs:
+                cursor = cursor.sort(find_kwargs["sort"])
+            if "skip" in find_kwargs:
+                cursor = cursor.skip(find_kwargs["skip"])
+            if "limit" in find_kwargs:
+                cursor = cursor.limit(find_kwargs["limit"])
+
+            results = list(cursor)
+            envelope["results"] = results
+
+            return make_json_safe(envelope)
     except Exception as e:
         envelope["error"] = f"MongoDB execution error: {str(e)}"
-        raise HTTPException(status_code=400, detail=envelope)
+        logger.error("MongoDB execution error: %s", json.dumps(envelope, default=str, indent=2))
+        raise HTTPException(status_code=400, detail=make_json_safe(envelope))
 
 
 @app.get("/test_ollama")
@@ -278,9 +459,6 @@ def test_ollama():
         return {"status": "error", "message": str(e)}
 
 
-# ---------------------
-# GET endpoint: Health check
-# ---------------------
 @app.get("/health")
 def health_check():
     return {"status": "running"}

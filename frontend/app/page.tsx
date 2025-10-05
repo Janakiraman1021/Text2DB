@@ -11,6 +11,7 @@ export default function Page() {
       <div className="relative z-10 aether-bg text-foreground">
         <NeoHeader />
         <QueryConsole />
+        {/* Home contains only the query console; About/Features/Working are separate pages */}
       </div>
     </main>
   )
